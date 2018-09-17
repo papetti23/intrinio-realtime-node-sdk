@@ -20,7 +20,7 @@ class IntrinioRealtime extends EventEmitter {
     this.channels = {}
     this.joinedChannels = {}
     this.afterConnected = null // Promise
-    thi.self_heal_backoff = Array.from(SELF_HEAL_BACKOFFS)
+    this.self_heal_backoff = Array.from(SELF_HEAL_BACKOFFS)
     this.self_heal_ref = null
     this.quote_callback = null
     this.error_callback = null
