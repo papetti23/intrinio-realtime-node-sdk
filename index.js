@@ -30,16 +30,28 @@ class IntrinioRealtime extends EventEmitter {
       this._throw("Need a valid options parameter")
     }
 
-    if (!options.username) {
-      this._throw("Need a valid username")
+    if (options.api_key) {
+      if (!this._validAPIKey(options.api_key)) {
+        this._throw("API Key was formatted invalidly")
+      }
     }
+    else {
+      if (!options.username && !options.password) {
+        this._throw("API key or username and password are required")
+      }
 
-    if (!options.password) {
-      this._throw("Need a valid password")
+      if (!options.username) {
+        this._throw("Need a valid username")
+      }
+
+      if (!options.password) {
+        this._throw("Need a valid password")
+      }
     }
     
-    if (!options.provider || (options.provider != "iex" && options.provider != "quodd")) {
-      this._throw("Need a valid provider: iex or quodd")
+    var providers = ["iex", "quodd", "cryptoquote", "fxcm"]
+    if (!options.provider || !providers.includes(options.provider)) {
+      this._throw("Need a valid provider: iex, quodd, cryptoquote, or fxcm")
     }
 
     // Establish connection
@@ -99,7 +111,7 @@ class IntrinioRealtime extends EventEmitter {
       this.ready = true
       this.emit('connect')
       this._stopSelfHeal()
-      if (this.options.provider == "iex") { 
+      if (["iex", "cryptoquote", "fxcm"].includes(this.options.provider)) {
         this._refreshChannels() 
       }
     },
@@ -112,16 +124,69 @@ class IntrinioRealtime extends EventEmitter {
   }
   
   _makeAuthUrl() {
+    var auth_url = {
+      host: "",
+      path: ""
+    }
+
     if (this.options.provider == "iex") {
-      return {
+      auth_url = {
         host: "realtime.intrinio.com",
         path: "/auth"
       }
     }
     else if (this.options.provider == "quodd") {
-      return {
+      auth_url = {
         host: "api.intrinio.com",
         path: "/token?type=QUODD"
+      }
+    }
+    else if (this.options.provider == "cryptoquote") {
+      auth_url = {
+        host: "crypto.intrinio.com",
+        path: "/auth"
+      }
+    }
+    else if (this.options.provider == "fxcm") {
+      auth_url = {
+        host: "fxcm.intrinio.com",
+        path: "/auth"
+      }
+    }
+
+    if (this.options.api_key) {
+      auth_url = this._makeAPIAuthUrl(auth_url)
+    }
+
+    return auth_url
+  }
+
+  _makeAPIAuthUrl(auth_url) {
+    var path = auth_url.path
+
+    if (path.includes("?")) {
+      path = path + "&"
+    }
+    else {
+      path = path + "?"
+    }
+
+    auth_url.path = path + "api_key=" + this.options.api_key
+    return auth_url
+  }
+
+  _makeHeaders() {
+    if (this.options.api_key) {
+      return {
+        'Content-Type': 'application/json'
+      }
+    }
+    else {
+      var { username, password } = this.options
+
+      return {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + new Buffer((username + ':' + password)).toString('base64')
       }
     }
   }
@@ -130,19 +195,16 @@ class IntrinioRealtime extends EventEmitter {
     this._debug("Requesting auth token...")
 
     return new Promise((fulfill, reject) => {
-      var { username, password } = this.options
       var agent = this.options.agent || false
       var { host, path } = this._makeAuthUrl()
+      var headers = this._makeHeaders()
 
       // Get token
       var options = {
         host: host,
         path: path,
         agent: agent,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Basic ' + new Buffer((username + ':' + password)).toString('base64')
-        }
+        headers: headers
       }
       
       var req = https.get(options, res => {
@@ -179,6 +241,12 @@ class IntrinioRealtime extends EventEmitter {
     else if (this.options.provider == "quodd") {
       return 'wss://www5.quodd.com/websocket/webStreamer/intrinio/' + encodeURIComponent(this.token)
     }
+    else if (this.options.provider == "cryptoquote") {
+      return 'wss://crypto.intrinio.com/socket/websocket?vsn=1.0.0&token=' + encodeURIComponent(this.token)
+    }
+    else if (this.options.provider == "fxcm") {
+      return 'wss://fxcm.intrinio.com/socket/websocket?vsn=1.0.0&token=' + encodeURIComponent(this.token)
+    }
   }
   
   _refreshWebsocket() {
@@ -200,12 +268,14 @@ class IntrinioRealtime extends EventEmitter {
       this.websocket.on('close', (code, reason) => {
         this._debug("Websocket closed!")
         if (code != WS_CLOSE_REASON_USER) {
+          this.joinedChannels = {}
           this._trySelfHeal()
         }
       })
 
       this.websocket.on('error', e => {
         console.error("IntrinioRealtime | Websocket error: " + e)
+        this.joinedChannels = {}
         reject(e)
       })
 
@@ -217,10 +287,15 @@ class IntrinioRealtime extends EventEmitter {
           this._debug('Non-quote message: ', data)
           return
         }
-        
+
         var quote = null
-        
-        if (this.options.provider == "iex") {
+
+        if (message.event == "phx_reply" && message.payload.status == "error") {
+          var error = message.payload.response
+          console.error("IntrinioRealtime | Websocket data error: " + error)
+          this._throw(error)
+        }
+        else if (this.options.provider == "iex") {
           if (message.event === 'quote') {
             quote = message.payload
           }
@@ -231,6 +306,16 @@ class IntrinioRealtime extends EventEmitter {
           }
           else if (message.event === 'quote' || message.event == 'trade') {
             quote = message.data
+          }
+        }
+        else if (this.options.provider == "cryptoquote") {
+          if (message.event === 'book_update' || message.event === 'ticker' || message.event === 'trade') {
+            quote = message.payload
+          }
+        }
+        else if (this.options.provider == "fxcm") {
+          if (message.event === 'price_update') {
+            quote = message.payload
           }
         }
         
@@ -304,11 +389,11 @@ class IntrinioRealtime extends EventEmitter {
   }
 
   _makeHeartbeatMessage() {
-    if (this.options.provider == "iex") {
-      return {topic: 'phoenix', event: 'heartbeat', payload: {}, ref: null}
-    }
-    else if (this.options.provider == "quodd") {
+    if (this.options.provider == "quodd") {
       return {event: 'heartbeat', data: {action: 'heartbeat', ticker: Date.now()}}
+    }
+    else if (["iex", "cryptoquote", "fxcm"].includes(this.options.provider)) {
+      return {topic: 'phoenix', event: 'heartbeat', payload: {}, ref: null}
     }
   }
 
@@ -343,7 +428,7 @@ class IntrinioRealtime extends EventEmitter {
     })
 
     channels.forEach(channel => {
-      if (channel.length == 0 || channel.length > 20) {
+      if (channel.length == 0) {
         this._throw("Invalid channel provided")
       }
     })
@@ -369,6 +454,14 @@ class IntrinioRealtime extends EventEmitter {
         }
       }
     }
+    else if (["cryptoquote", "fxcm"].includes(this.options.provider)) {
+      return {
+        topic: channel,
+        event: 'phx_join',
+        payload: {},
+        ref: null
+      }
+    }
   }
   
   _makeLeaveMessage(channel) {
@@ -389,6 +482,14 @@ class IntrinioRealtime extends EventEmitter {
         }
       }
     }
+    else if (["cryptoquote", "fxcm"].includes(this.options.provider)) {
+      return {
+        topic: channel,
+        event: 'phx_leave',
+        payload: {},
+        ref: null
+      }
+    }
   }
 
   _parseIexTopic(channel) {
@@ -403,6 +504,18 @@ class IntrinioRealtime extends EventEmitter {
       topic = "iex:securities:" + channel
     }
     return topic
+  }
+
+  _validAPIKey(api_key) {
+    if (typeof api_key !== 'string') {
+      return false
+    }
+
+    if (api_key === "") {
+      return false
+    }
+
+    return true
   }
 
   destroy() {
